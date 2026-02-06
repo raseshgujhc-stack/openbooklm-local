@@ -4,17 +4,15 @@ import numpy as np
 from rag.chunker import chunk_text
 from rag.embedder import embed_texts
 from pathlib import Path
-from typing import List, Dict, Optional
-
-from db import get_repo   # ✅ NEW
+from typing import List, Dict, Optional, Tuple
+import sqlite3
 
 
 BASE_DIR = Path(__file__).parent.parent / "data" / "faiss"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-
 # ============================================================
-# SAVE (UNCHANGED)
+# SAVE (BACKWARD COMPATIBLE)
 # ============================================================
 
 def save_vectors(
@@ -22,6 +20,20 @@ def save_vectors(
     vectors: List[Dict],
     collection_id: Optional[str] = None,
 ):
+    """
+    vectors = [
+        {
+            "text": "...",
+            "embedding": [...],
+            "chunk_index": int (optional)
+        },
+        ...
+    ]
+
+    ⚠️ notebook_id behavior preserved
+    ✅ metadata added silently
+    """
+
     embeddings = np.array(
         [v["embedding"] for v in vectors],
         dtype="float32",
@@ -31,17 +43,19 @@ def save_vectors(
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
 
+    # --- Persist index ---
     faiss.write_index(
         index,
         str(BASE_DIR / f"{notebook_id}.index"),
     )
 
+    # --- Persist metadata ---
     metadata = []
     for i, v in enumerate(vectors):
         metadata.append({
             "text": v["text"],
             "notebook_id": notebook_id,
-            "collection_id": collection_id,
+            "collection_id": collection_id,   # future use
             "chunk_index": v.get("chunk_index", i),
         })
 
@@ -54,10 +68,14 @@ def save_vectors(
 
 
 # ============================================================
-# LOAD INDEX + METADATA (UNCHANGED)
+# LOAD INDEX + METADATA (UNCHANGED API)
 # ============================================================
 
 def load_vectors(notebook_id: str):
+    """
+    Returns:
+        index, metadata_list
+    """
     index_path = BASE_DIR / f"{notebook_id}.index"
     meta_path = BASE_DIR / f"{notebook_id}.json"
 
@@ -75,6 +93,10 @@ def load_vectors(notebook_id: str):
 # ============================================================
 
 def load_texts(notebook_id: str) -> List[str]:
+    """
+    Load all text chunks for podcast generation.
+    ⚠️ Existing behavior preserved
+    """
     meta_path = BASE_DIR / f"{notebook_id}.json"
 
     if not meta_path.exists():
@@ -85,7 +107,7 @@ def load_texts(notebook_id: str) -> List[str]:
 
 
 # ============================================================
-# QUERY (UNCHANGED)
+# QUERY (NEW – SAFE TO ADD)
 # ============================================================
 
 def query_vectors(
@@ -93,6 +115,11 @@ def query_vectors(
     query_embedding: List[float],
     top_k: int = 10,
 ):
+    """
+    Semantic search inside ONE notebook.
+    Collection-aware in future.
+    """
+
     loaded = load_vectors(notebook_id)
     if not loaded:
         return []
@@ -124,42 +151,43 @@ def delete_vectors(notebook_id: str):
 
     if meta_path.exists():
         meta_path.unlink()
-
-
-# ============================================================
-# BUILD VECTORS (UNCHANGED)
-# ============================================================
+#=============================================================
+# Build Vectors
+#============================================================
 
 def build_vectors(notebook_id, full_text):
     chunks = chunk_text(full_text)
+
     embeddings = embed_texts(chunks)
 
-    return [
-        {"text": text, "embedding": emb}
-        for text, emb in zip(chunks, embeddings)
-    ]
+    vectors = []
+    for text, emb in zip(chunks, embeddings):
+        vectors.append({
+            "text": text,
+            "embedding": emb,
+        })
+
+    return vectors
 
 
 # ============================================================
-# COLLECTION-AWARE FUNCTIONS (POSTGRES)
+# COLLECTION-AWARE FUNCTIONS
 # ============================================================
 
 def get_collection_notebooks(collection_id: str, user_id: str) -> List[str]:
-    """
-    Get all notebook IDs in a collection (PostgreSQL)
-    """
-    repo = get_repo()
-    conn = repo.conn
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT notebook_id
-        FROM notebooks
-        WHERE collection_id = %s AND user_id = %s
+    """Get all notebook IDs in a collection"""
+    conn = sqlite3.connect('data/notebooks.db')
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT notebook_id FROM notebooks 
+        WHERE collection_id = ? AND user_id = ?
     """, (collection_id, user_id))
-
-    return [row[0] for row in cur.fetchall()]
-
+    
+    notebook_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    return notebook_ids
 
 def search_across_collection(
     collection_id: str,
@@ -170,6 +198,7 @@ def search_across_collection(
     """
     Search across all notebooks in a collection.
     GUARANTEES at least ONE result per notebook.
+    Designed for document-wise extraction.
     """
 
     notebook_ids = get_collection_notebooks(collection_id, user_id)
@@ -206,6 +235,7 @@ def search_across_collection(
     return all_results
 
 
+
 def save_to_collection(
     notebook_id: str,
     vectors: List[Dict],
@@ -213,47 +243,53 @@ def save_to_collection(
     filename: str = None
 ):
     """
-    Save vectors and update notebook collection (PostgreSQL)
+    Save vectors with collection metadata
     """
+    # Save to FAISS (existing function)
     save_vectors(notebook_id, vectors, collection_id)
-
-    repo = get_repo()
-    conn = repo.conn
-    cur = conn.cursor()
-
+    
+    # Update database with collection info
+    conn = sqlite3.connect('data/notebooks.db')
+    cursor = conn.cursor()
+    
     if filename:
-        cur.execute("""
-            UPDATE notebooks
-            SET collection_id = %s, filename = %s
-            WHERE notebook_id = %s
+        cursor.execute("""
+            UPDATE notebooks 
+            SET collection_id = ?, filename = ?
+            WHERE notebook_id = ?
         """, (collection_id, filename, notebook_id))
     else:
-        cur.execute("""
-            UPDATE notebooks
-            SET collection_id = %s
-            WHERE notebook_id = %s
+        cursor.execute("""
+            UPDATE notebooks 
+            SET collection_id = ?
+            WHERE notebook_id = ?
         """, (collection_id, notebook_id))
-
+    
     conn.commit()
-
+    conn.close()
 
 # ============================================================
-# ENHANCED LOAD FUNCTION (UNCHANGED)
+# ENHANCED LOAD FUNCTION
 # ============================================================
 
 def load_collection_vectors(collection_id: str, user_id: str = None):
+    """
+    Load all vectors from all notebooks in a collection
+    Returns combined metadata list
+    """
     notebook_ids = get_collection_notebooks(collection_id, user_id)
+    
     all_metadata = []
-
+    
     for notebook_id in notebook_ids:
         meta_path = BASE_DIR / f"{notebook_id}.json"
-
+        
         if meta_path.exists():
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-
+            
+            # Add notebook_id to each metadata entry
             for meta in metadata:
                 meta["notebook_id"] = notebook_id
                 all_metadata.append(meta)
-
+    
     return all_metadata
-

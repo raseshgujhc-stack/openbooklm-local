@@ -1,0 +1,3 @@
+[submodule "openbooklm-ui"]
+	path = openbooklm-ui
+	url = https://github.com/open-biz/OpenBookLM

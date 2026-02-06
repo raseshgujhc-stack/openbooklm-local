@@ -1,0 +1,56 @@
+# ========================
+# Python
+# ========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+.env.*
+
+# ========================
+# Models (VERY IMPORTANT)
+# ========================
+models/
+*.bin
+*.gguf
+*.safetensors
+*.pt
+*.onnx
+
+# ========================
+# Vector & Index Data
+# ========================
+data/faiss/
+vector_store/
+*.index
+*.json
+
+# ========================
+# Audio & Media
+# ========================
+data/audio/
+*.wav
+*.mp3
+
+# ========================
+# PDFs & Uploads
+# ========================
+uploaded_pdfs/
+*.pdf
+
+# ========================
+# Database & Dumps
+# ========================
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+
+# ========================
+# Logs & Temp
+# ========================
+logs/
+*.log
+tmp/

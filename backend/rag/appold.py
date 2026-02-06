@@ -16,23 +16,17 @@ import json
 from pathlib import Path
 import os
 from fastapi.responses import StreamingResponse
-from typing import Optional
-
-from db import get_repo   # ✅ PostgreSQL repo
 
 from rag.podcast import generate_podcast_script
+from rag.db import get_db, init_db, init_chat_table
 from rag.pdf_reader import read_pdf
 from rag.text_splitter import split_text
 from rag.embedder import embed
 from rag.rag_pipeline import generate_answer
-from rag.vector_store import (
-    save_vectors,
-    load_vectors,
-    delete_vectors,
-    load_texts,
-    get_collection_notebooks,
-)
+from rag.vector_store import save_vectors, load_vectors, delete_vectors, load_texts, get_collection_notebooks
 from rag.podcast_worker import run_podcast_job
+from rag.auth import get_current_user_id
+from typing import Optional
 from rag.ingest import ingest_document
 
 
@@ -54,9 +48,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ❌ init_db()
-# ❌ init_chat_table()
-# PostgreSQL schema already exists
+init_db()
+init_chat_table()
 
 # --------------------------------------------------
 # Models
@@ -107,31 +100,23 @@ def root():
 
 @app.post("/login")
 def login(data: LoginRequest):
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, username, password_hash
-        FROM users
-        WHERE username = %s
-        """,
+    db = get_db()
+    user = db.execute(
+        "SELECT id, username, password_hash FROM users WHERE username = ?",
         (data.username,),
-    )
+    ).fetchone()
+    db.close()
 
-    user = cur.fetchone()
-
-    if not user or not verify_password(data.password, user[2]):
+    if not user or not verify_password(data.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     return {
-        "user_id": user[0],
-        "username": user[1],
+        "user_id": user["id"],
+        "username": user["username"],
     }
-# --------------------------------------------------
+
 # Upload PDF
 # --------------------------------------------------
-
 @app.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
@@ -142,25 +127,25 @@ async def upload_pdf(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Empty PDF")
 
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
     # 🔐 COLLECTION OWNERSHIP CHECK (ONLY IF PROVIDED)
     if collection_id:
-        cur.execute(
+        db = get_db()
+        owned = db.execute(
             """
             SELECT 1 FROM collections
-            WHERE collection_id = %s AND user_id = %s
+            WHERE collection_id = ? AND user_id = ?
             """,
             (collection_id, user_id),
-        )
-        owned = cur.fetchone()
+        ).fetchone()
 
         if not owned:
+            db.close()
             raise HTTPException(
                 status_code=403,
                 detail="Collection not found or not owned by user",
             )
+
+        db.close()
 
     # 🔹 Normal PDF pipeline (semantic + metadata)
     chunks = split_text(text)
@@ -171,7 +156,7 @@ async def upload_pdf(
     vectors = [{"text": c, "embedding": e} for c, e in zip(chunks, embeddings)]
     save_vectors(notebook_id, vectors)
 
-    # ---- Metadata ingestion (REQUIRED) ----
+    # ---- Metadata ingestion (NEW – REQUIRED) ----
     ingest_document(
         text=text,                     # full document text
         document_id=notebook_id,        # IMPORTANT: keep IDs aligned
@@ -180,18 +165,17 @@ async def upload_pdf(
         filename=file.filename,
     )
 
-    # ---- Notebooks table ----
-    cur.execute(
+    # ---- Notebooks table (UNCHANGED) ----
+    db = get_db()
+    db.execute(
         """
         INSERT INTO notebooks (notebook_id, filename, user_id, collection_id)
-        VALUES (%s, %s, %s, %s)
+        VALUES (?, ?, ?, ?)
         """,
         (notebook_id, file.filename, user_id, collection_id),
     )
-    repo.conn.commit()
-
-    return {"notebook_id": notebook_id}
-
+    db.commit()
+    db.close()
 
 # --------------------------------------------------
 # List notebooks
@@ -199,44 +183,36 @@ async def upload_pdf(
 
 @app.get("/notebooks")
 def list_notebooks(user_id: str = Depends(get_current_user_id)):
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    cur.execute(
+    db = get_db()
+    rows = db.execute(
         """
         SELECT notebook_id, filename, created_at, collection_id
         FROM notebooks
-        WHERE user_id = %s
+        WHERE user_id = ?
         ORDER BY created_at DESC
         """,
         (user_id,),
-    )
-    rows = cur.fetchall()
+    ).fetchall()
+    db.close()
 
     notebooks = []
-
     for r in rows:
-        notebook = {
-            "notebook_id": r[0],
-            "filename": r[1],
-            "created_at": r[2],
-            "collection_id": r[3],
-        }
-
+        notebook = dict(r)
         # Get collection name if exists
-        if r[3]:
-            cur.execute(
-                "SELECT name FROM collections WHERE collection_id = %s",
-                (r[3],),
-            )
-            collection = cur.fetchone()
-            notebook["collection_name"] = collection[0] if collection else None
+        if notebook["collection_id"]:
+            db2 = get_db()
+            collection = db2.execute(
+                "SELECT name FROM collections WHERE collection_id = ?",
+                (notebook["collection_id"],)
+            ).fetchone()
+            db2.close()
+            notebook["collection_name"] = collection["name"] if collection else None
         else:
             notebook["collection_name"] = None
-
         notebooks.append(notebook)
-
+    
     return notebooks
+
 # --------------------------------------------------
 # Single PDF Chat
 # --------------------------------------------------
@@ -252,54 +228,40 @@ def pdf_chat(
     if not notebook_id or not question:
         raise HTTPException(status_code=400, detail="Missing data")
 
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    # Verify notebook ownership
-    cur.execute(
-        """
-        SELECT 1 FROM notebooks
-        WHERE notebook_id = %s AND user_id = %s
-        """,
+    db = get_db()
+    owned = db.execute(
+        "SELECT 1 FROM notebooks WHERE notebook_id=? AND user_id=?",
         (notebook_id, user_id),
-    )
-    owned = cur.fetchone()
+    ).fetchone()
 
     if not owned:
+        db.close()
         raise HTTPException(status_code=403, detail="Forbidden")
 
     loaded = load_vectors(notebook_id)
     if loaded:
-        _, metadata = loaded
+        index, metadata = loaded
         vectors = metadata
     else:
         vectors = []
 
     answer = generate_answer(question, vectors, notebook_id)
 
-    # Store chat history
-    cur.execute(
-        """
-        INSERT INTO chat_history (notebook_id, role, content)
-        VALUES (%s, %s, %s)
-        """,
+    db.execute(
+        "INSERT INTO chat_history (notebook_id, role, content) VALUES (?, ?, ?)",
         (notebook_id, "user", question),
     )
-    cur.execute(
-        """
-        INSERT INTO chat_history (notebook_id, role, content)
-        VALUES (%s, %s, %s)
-        """,
+    db.execute(
+        "INSERT INTO chat_history (notebook_id, role, content) VALUES (?, ?, ?)",
         (notebook_id, "assistant", answer),
     )
-
-    repo.conn.commit()
+    db.commit()
+    db.close()
 
     return {"answer": answer}
 
-
 # --------------------------------------------------
-# Collection Chat
+# Collection Chat (NEW)
 # --------------------------------------------------
 
 @app.post("/collection-chat")
@@ -312,64 +274,57 @@ def collection_chat(
     """
     if not payload.collection_id or not payload.question:
         raise HTTPException(status_code=400, detail="Missing collection_id or question")
-
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
+    
     # Verify collection ownership
-    cur.execute(
-        """
-        SELECT name FROM collections
-        WHERE collection_id = %s AND user_id = %s
-        """,
+    db = get_db()
+    owned = db.execute(
+        "SELECT name FROM collections WHERE collection_id=? AND user_id=?",
         (payload.collection_id, user_id),
-    )
-    owned = cur.fetchone()
-
+    ).fetchone()
+    
     if not owned:
+        db.close()
         raise HTTPException(status_code=403, detail="Collection not found or not owned")
-
-    collection_name = owned[0]
-
+    
+    collection_name = owned["name"]
+    db.close()
+    
     # Generate answer using collection-aware pipeline
     answer = generate_answer(
         question=payload.question,
         collection_id=payload.collection_id,
-        user_id=user_id,
+        user_id=user_id
     )
-
-    # Store in collection chat history
+    
+    # Store in chat history (create table if not exists)
+    db = get_db()
     try:
-        cur.execute(
-            """
-            INSERT INTO collection_chat_history
-            (collection_id, user_id, role, content)
-            VALUES (%s, %s, %s, %s)
-            """,
+        db.execute(
+            "INSERT INTO collection_chat_history (collection_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (payload.collection_id, user_id, "user", payload.question),
         )
-        cur.execute(
-            """
-            INSERT INTO collection_chat_history
-            (collection_id, user_id, role, content)
-            VALUES (%s, %s, %s, %s)
-            """,
+        db.execute(
+            "INSERT INTO collection_chat_history (collection_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (payload.collection_id, user_id, "assistant", answer),
         )
-        repo.conn.commit()
+        db.commit()
     except Exception as e:
-        # Table might not exist (backward compatibility)
+        # Table might not exist, but that's OK for now
         print(f"Note: collection_chat_history table not available: {e}")
-
+        pass
+    finally:
+        db.close()
+    
     # Get notebook count for info
     notebook_ids = get_collection_notebooks(payload.collection_id, user_id)
-
+    
     return {
         "answer": answer,
         "collection_id": payload.collection_id,
         "collection_name": collection_name,
-        "sources": len(notebook_ids),
+        "sources": len(notebook_ids)
     }
+
 # --------------------------------------------------
 # Delete notebook
 # --------------------------------------------------
@@ -379,39 +334,23 @@ def delete_notebook(
     notebook_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    # Verify ownership
-    cur.execute(
-        """
-        SELECT 1 FROM notebooks
-        WHERE notebook_id = %s AND user_id = %s
-        """,
+    db = get_db()
+    owned = db.execute(
+        "SELECT 1 FROM notebooks WHERE notebook_id=? AND user_id=?",
         (notebook_id, user_id),
-    )
-    owned = cur.fetchone()
+    ).fetchone()
 
     if not owned:
+        db.close()
         raise HTTPException(status_code=404, detail="Not found")
 
-    # Delete notebook + chat history
-    cur.execute(
-        "DELETE FROM notebooks WHERE notebook_id = %s",
-        (notebook_id,),
-    )
-    cur.execute(
-        "DELETE FROM chat_history WHERE notebook_id = %s",
-        (notebook_id,),
-    )
+    db.execute("DELETE FROM notebooks WHERE notebook_id=?", (notebook_id,))
+    db.execute("DELETE FROM chat_history WHERE notebook_id=?", (notebook_id,))
+    db.commit()
+    db.close()
 
-    repo.conn.commit()
-
-    # Remove FAISS vectors
     delete_vectors(notebook_id)
-
     return {"status": "deleted"}
-
 
 # --------------------------------------------------
 # Chat history
@@ -422,38 +361,25 @@ def get_chat_history(
     notebook_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    cur.execute(
+    db = get_db()
+    rows = db.execute(
         """
         SELECT role, content, created_at
         FROM chat_history
-        WHERE notebook_id = %s
-          AND notebook_id IN (
-              SELECT notebook_id
-              FROM notebooks
-              WHERE user_id = %s
-          )
+        WHERE notebook_id = ?
+        AND notebook_id IN (
+            SELECT notebook_id FROM notebooks WHERE user_id = ?
+        )
         ORDER BY created_at ASC
         """,
         (notebook_id, user_id),
-    )
+    ).fetchall()
+    db.close()
 
-    rows = cur.fetchall()
-
-    return [
-        {
-            "role": r[0],
-            "content": r[1],
-            "created_at": r[2],
-        }
-        for r in rows
-    ]
-
+    return [dict(r) for r in rows]
 
 # --------------------------------------------------
-# Collection Contents
+# Collection Contents (NEW)
 # --------------------------------------------------
 
 @app.get("/collection/{collection_id}/contents")
@@ -464,69 +390,62 @@ def get_collection_contents(
     """
     Get all notebooks and their info in a collection
     """
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
+    db = get_db()
+    
     # Verify ownership
-    cur.execute(
-        """
-        SELECT name
-        FROM collections
-        WHERE collection_id = %s AND user_id = %s
-        """,
+    owned = db.execute(
+        "SELECT name FROM collections WHERE collection_id=? AND user_id=?",
         (collection_id, user_id),
-    )
-    owned = cur.fetchone()
-
+    ).fetchone()
+    
     if not owned:
+        db.close()
         raise HTTPException(status_code=403, detail="Collection not found or not owned")
-
-    collection_name = owned[0]
-
-    # Get notebooks in collection
-    cur.execute(
+    
+    collection_name = owned["name"]
+    
+    # Get all notebooks in collection
+    notebooks = db.execute(
         """
         SELECT notebook_id, filename, created_at
         FROM notebooks
-        WHERE collection_id = %s AND user_id = %s
+        WHERE collection_id=? AND user_id=?
         ORDER BY created_at
         """,
         (collection_id, user_id),
-    )
-    notebooks = cur.fetchall()
-
+    ).fetchall()
+    
+    db.close()
+    
+    # Get chunk counts for each notebook
     notebook_details = []
-
     for nb in notebooks:
-        notebook_id, filename, created_at = nb
-
-        meta_path = BASE_DIR / "data" / "faiss" / f"{notebook_id}.json"
+        meta_path = BASE_DIR / "data" / "faiss" / f"{nb['notebook_id']}.json"
         chunk_count = 0
-
+        
         if meta_path.exists():
             try:
                 metadata = json.loads(meta_path.read_text(encoding="utf-8"))
                 chunk_count = len(metadata)
-            except Exception:
+            except:
                 chunk_count = 0
-
-        notebook_details.append(
-            {
-                "notebook_id": notebook_id,
-                "filename": filename,
-                "created_at": created_at,
-                "chunk_count": chunk_count,
-            }
-        )
-
+        
+        notebook_details.append({
+            "notebook_id": nb["notebook_id"],
+            "filename": nb["filename"],
+            "created_at": nb["created_at"],
+            "chunk_count": chunk_count
+        })
+    
     return {
         "collection_id": collection_id,
         "collection_name": collection_name,
         "notebooks": notebook_details,
-        "total_notebooks": len(notebook_details),
+        "total_notebooks": len(notebook_details)
     }
+
 # --------------------------------------------------
-# Search Across Collection
+# Search Across Collection (NEW)
 # --------------------------------------------------
 
 @app.post("/collection/{collection_id}/search")
@@ -539,69 +458,61 @@ def search_collection(
     Semantic search across collection (returns raw results, not answers)
     """
     from rag.similarity import similarity_search
-
+    
     question = payload.get("question", "")
     top_k = payload.get("top_k", 10)
-
+    
     if not question:
         raise HTTPException(status_code=400, detail="Missing question")
-
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
+    
     # Verify ownership
-    cur.execute(
-        """
-        SELECT name
-        FROM collections
-        WHERE collection_id = %s AND user_id = %s
-        """,
+    db = get_db()
+    owned = db.execute(
+        "SELECT name FROM collections WHERE collection_id=? AND user_id=?",
         (collection_id, user_id),
-    )
-    owned = cur.fetchone()
-
+    ).fetchone()
+    
     if not owned:
+        db.close()
         raise HTTPException(status_code=403, detail="Collection not found or not owned")
-
-    collection_name = owned[0]
-
-    # Perform semantic search
+    
+    collection_name = owned["name"]
+    db.close()
+    
+    # Perform search
     results = similarity_search(
         question=question,
         collection_id=collection_id,
         user_id=user_id,
-        TOP_K=top_k,
+        TOP_K=top_k
     )
-
+    
     # Format results with preview
     formatted_results = []
     for result in results:
         text_preview = result.get("text", "")
         if len(text_preview) > 300:
             text_preview = text_preview[:300] + "..."
-
-        formatted_results.append(
-            {
-                "text": result.get("text", ""),
-                "preview": text_preview,
-                "score": round(result.get("score", 0), 4),
-                "notebook_id": result.get("notebook_id", ""),
-                "source": result.get("source", "Unknown"),
-                "chunk_index": result.get("chunk_index", 0),
-            }
-        )
-
+        
+        formatted_results.append({
+            "text": result.get("text", ""),
+            "preview": text_preview,
+            "score": round(result.get("score", 0), 4),
+            "notebook_id": result.get("notebook_id", ""),
+            "source": result.get("source", "Unknown"),
+            "chunk_index": result.get("chunk_index", 0)
+        })
+    
     return {
         "collection_id": collection_id,
         "collection_name": collection_name,
         "question": question,
         "total_results": len(results),
-        "results": formatted_results,
+        "results": formatted_results
     }
 
-
 # --------------------------------------------------
-# Collection History
+# Collection History (NEW)
 # --------------------------------------------------
 
 @app.get("/collection/{collection_id}/history")
@@ -612,55 +523,47 @@ def get_collection_chat_history(
     """
     Get chat history for a collection
     """
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
+    db = get_db()
+    
     # Verify ownership
-    cur.execute(
-        """
-        SELECT name
-        FROM collections
-        WHERE collection_id = %s AND user_id = %s
-        """,
+    owned = db.execute(
+        "SELECT name FROM collections WHERE collection_id=? AND user_id=?",
         (collection_id, user_id),
-    )
-    owned = cur.fetchone()
-
+    ).fetchone()
+    
     if not owned:
+        db.close()
         raise HTTPException(status_code=403, detail="Collection not found or not owned")
-
-    collection_name = owned[0]
-
-    # Fetch history (table may or may not exist)
+    
+    # Try to get from collection_chat_history table
     try:
-        cur.execute(
+        rows = db.execute(
             """
             SELECT role, content, created_at
             FROM collection_chat_history
-            WHERE collection_id = %s AND user_id = %s
+            WHERE collection_id = ? AND user_id = ?
             ORDER BY created_at ASC
             """,
             (collection_id, user_id),
-        )
-        rows = cur.fetchall()
-
-        history = [
-            {
-                "role": r[0],
-                "content": r[1],
-                "created_at": r[2],
-            }
-            for r in rows
-        ]
+        ).fetchall()
+        
+        if rows:
+            history = [dict(r) for r in rows]
+        else:
+            # Fallback to empty list if table doesn't exist or no history
+            history = []
+            
     except Exception:
+        # Table might not exist
         history = []
-
+    
+    db.close()
+    
     return {
         "collection_id": collection_id,
-        "collection_name": collection_name,
-        "history": history,
+        "collection_name": owned["name"],
+        "history": history
     }
-
 
 # --------------------------------------------------
 # Create Collection
@@ -672,24 +575,23 @@ def create_collection(
     user_id: str = Depends(get_current_user_id),
 ):
     collection_id = str(uuid.uuid4())
+    db = get_db()
 
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    cur.execute(
+    db.execute(
         """
         INSERT INTO collections (collection_id, name, user_id)
-        VALUES (%s, %s, %s)
+        VALUES (?, ?, ?)
         """,
         (collection_id, data.name, user_id),
     )
-
-    repo.conn.commit()
+    db.commit()
+    db.close()
 
     return {
         "collection_id": collection_id,
         "name": data.name,
     }
+
 # --------------------------------------------------
 # List Collections
 # --------------------------------------------------
@@ -698,39 +600,33 @@ def create_collection(
 def list_collections(
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    cur.execute(
+    db = get_db()
+    rows = db.execute(
         """
         SELECT 
-            c.collection_id,
-            c.name,
+            c.collection_id, 
+            c.name, 
             c.created_at,
-            COUNT(n.notebook_id) AS notebook_count
+            COUNT(n.notebook_id) as notebook_count
         FROM collections c
-        LEFT JOIN notebooks n
-          ON c.collection_id = n.collection_id
-         AND n.user_id = c.user_id
-        WHERE c.user_id = %s
-        GROUP BY c.collection_id, c.name, c.created_at
+        LEFT JOIN notebooks n ON c.collection_id = n.collection_id AND n.user_id = c.user_id
+        WHERE c.user_id=?
+        GROUP BY c.collection_id
         ORDER BY c.created_at DESC
         """,
         (user_id,),
-    )
-
-    rows = cur.fetchall()
+    ).fetchall()
+    db.close()
 
     return [
         {
-            "collection_id": r[0],
-            "name": r[1],
-            "created_at": r[2],
-            "notebook_count": r[3] or 0,
+            "collection_id": r["collection_id"],
+            "name": r["name"],
+            "created_at": r["created_at"],
+            "notebook_count": r["notebook_count"] or 0
         }
         for r in rows
     ]
-
 
 # --------------------------------------------------
 # Delete Collection
@@ -741,53 +637,52 @@ def delete_collection(
     collection_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
+    db = get_db()
 
-    # Verify ownership
-    cur.execute(
+    owned = db.execute(
         """
-        SELECT 1
-        FROM collections
-        WHERE collection_id = %s AND user_id = %s
+        SELECT 1 FROM collections
+        WHERE collection_id=? AND user_id=?
         """,
         (collection_id, user_id),
-    )
-    owned = cur.fetchone()
+    ).fetchone()
 
     if not owned:
+        db.close()
         raise HTTPException(status_code=404, detail="Collection not found")
 
-    # Unlink notebooks from collection
-    cur.execute(
+    # unlink notebooks
+    db.execute(
         """
         UPDATE notebooks
-        SET collection_id = NULL
-        WHERE collection_id = %s AND user_id = %s
+        SET collection_id=NULL
+        WHERE collection_id=? AND user_id=?
         """,
         (collection_id, user_id),
     )
 
-    # Delete collection
-    cur.execute(
-        "DELETE FROM collections WHERE collection_id = %s",
+    # delete collection
+    db.execute(
+        "DELETE FROM collections WHERE collection_id=?",
         (collection_id,),
     )
-
-    # Clean up collection chat history (best-effort)
+    
+    # Clean up collection chat history
     try:
-        cur.execute(
-            "DELETE FROM collection_chat_history WHERE collection_id = %s",
+        db.execute(
+            "DELETE FROM collection_chat_history WHERE collection_id=?",
             (collection_id,),
         )
-    except Exception:
-        pass
+    except:
+        pass  # Table might not exist
 
-    repo.conn.commit()
+    db.commit()
+    db.close()
 
     return {"status": "deleted"}
+
 # --------------------------------------------------
-# PODCAST ENDPOINTS
+# PODCAST ENDPOINTS (Existing - Unchanged)
 # --------------------------------------------------
 
 @app.post("/podcast/generate")
@@ -795,31 +690,28 @@ def generate_podcast(
     data: PodcastRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
+    db = get_db()
 
-    # Verify notebook ownership
-    cur.execute(
-        """
-        SELECT 1 FROM notebooks
-        WHERE notebook_id = %s AND user_id = %s
-        """,
+    owned = db.execute(
+        "SELECT 1 FROM notebooks WHERE notebook_id=? AND user_id=?",
         (data.notebook_id, user_id),
-    )
-    if not cur.fetchone():
+    ).fetchone()
+
+    if not owned:
+        db.close()
         raise HTTPException(status_code=403, detail="Forbidden")
 
     job_id = str(uuid.uuid4())
 
-    cur.execute(
+    db.execute(
         """
-        INSERT INTO podcast_jobs
-        (id, notebook_id, user_id, status, speakers)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO podcast_jobs (id, notebook_id, user_id, status, speakers)
+        VALUES (?, ?, ?, ?, ?)
         """,
         (job_id, data.notebook_id, user_id, "pending", data.speakers),
     )
-    repo.conn.commit()
+    db.commit()
+    db.close()
 
     threading.Thread(
         target=run_podcast_job,
@@ -829,81 +721,79 @@ def generate_podcast(
 
     return {"job_id": job_id}
 
-
 @app.get("/podcast/status/{job_id}")
 def podcast_status(
     job_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
+    db = get_db()
 
-    cur.execute(
+    row = db.execute(
         """
         SELECT status, result
         FROM podcast_jobs
-        WHERE id = %s AND user_id = %s
+        WHERE id=? AND user_id=?
         """,
         (job_id, user_id),
-    )
-    row = cur.fetchone()
+    ).fetchone()
+
+    db.close()
 
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
     return {
-        "status": row[0],
-        "result": row[1] if row[0] in ("script_ready", "done") else None,
+        "status": row["status"],
+        "result": row["result"] if row["status"] in ("script_ready", "done") else None,
     }
-
 
 @app.get("/podcast/latest/{notebook_id}")
 def get_latest_podcast(
     notebook_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
+    db = get_db()
 
-    cur.execute(
+    row = db.execute(
         """
         SELECT id, result, speakers
         FROM podcast_jobs
-        WHERE notebook_id = %s
-          AND user_id = %s
+        WHERE notebook_id=?
+          AND user_id=?
           AND status IN ('script_ready', 'done')
         ORDER BY created_at DESC
         LIMIT 1
         """,
         (notebook_id, user_id),
-    )
-    row = cur.fetchone()
+    ).fetchone()
+
+    db.close()
 
     if not row:
         raise HTTPException(status_code=404, detail="No podcast found")
 
     return {
-        "job_id": row[0],
-        "result": row[1],
-        "speakers": row[2],
+        "job_id": row["id"],
+        "result": row["result"],
+        "speakers": row["speakers"],
     }
-
 
 @app.get("/podcast/audio/{job_id}")
 def get_podcast_audio(job_id: str):
-    repo = get_repo()
-    cur = repo.conn.cursor()
+    db = get_db()
 
-    cur.execute(
-        "SELECT audio_path FROM podcast_jobs WHERE id = %s",
+    row = db.execute(
+        "SELECT audio_path FROM podcast_jobs WHERE id=?",
         (job_id,),
-    )
-    row = cur.fetchone()
+    ).fetchone()
 
-    if not row or not row[0]:
+    db.close()
+
+    if not row or not row["audio_path"]:
         raise HTTPException(status_code=404, detail="Audio not ready")
 
-    audio_path = Path(row[0])
+    audio_path = Path(row["audio_path"])
+
     if not audio_path.exists():
         raise HTTPException(status_code=404, detail="Audio file missing")
 
@@ -922,11 +812,7 @@ def get_podcast_audio(job_id: str):
             "Content-Disposition": f'inline; filename="{audio_path.name}"',
         },
     )
-
-
-# --------------------------------------------------
-# REMOVE NOTEBOOK FROM COLLECTION
-# --------------------------------------------------
+#-------- REMOVE NOTEBOOK FROM COLLECTION ENDPOINT ------------------------
 
 @app.delete("/collection/{collection_id}/notebook/{notebook_id}")
 def remove_notebook_from_collection(
@@ -934,44 +820,37 @@ def remove_notebook_from_collection(
     notebook_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    repo = get_repo()
-    cur = repo.conn.cursor()
-
-    # Verify collection ownership
-    cur.execute(
-        """
-        SELECT 1 FROM collections
-        WHERE collection_id = %s AND user_id = %s
-        """,
+    """
+    Remove a notebook from a collection
+    """
+    db = get_db()
+    
+    # Verify ownership
+    owned = db.execute(
+        "SELECT 1 FROM collections WHERE collection_id=? AND user_id=?",
         (collection_id, user_id),
-    )
-    if not cur.fetchone():
+    ).fetchone()
+    
+    if not owned:
+        db.close()
         raise HTTPException(status_code=403, detail="Collection not found or not owned")
-
-    # Verify notebook ownership
-    cur.execute(
-        """
-        SELECT 1 FROM notebooks
-        WHERE notebook_id = %s AND user_id = %s
-        """,
+    
+    # Verify notebook exists and belongs to user
+    notebook = db.execute(
+        "SELECT 1 FROM notebooks WHERE notebook_id=? AND user_id=?",
         (notebook_id, user_id),
-    )
-    if not cur.fetchone():
+    ).fetchone()
+    
+    if not notebook:
+        db.close()
         raise HTTPException(status_code=404, detail="Notebook not found")
-
-    # Remove notebook from collection
-    cur.execute(
-        """
-        UPDATE notebooks
-        SET collection_id = NULL
-        WHERE notebook_id = %s AND collection_id = %s
-        """,
+    
+    # Remove from collection (set collection_id to NULL)
+    db.execute(
+        "UPDATE notebooks SET collection_id = NULL WHERE notebook_id = ? AND collection_id = ?",
         (notebook_id, collection_id),
     )
-    repo.conn.commit()
-
-    return {
-        "status": "removed",
-        "notebook_id": notebook_id,
-        "collection_id": collection_id,
-    }
+    db.commit()
+    db.close()
+    
+    return {"status": "removed", "notebook_id": notebook_id, "collection_id": collection_id}

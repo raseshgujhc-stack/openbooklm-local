@@ -1,0 +1,31 @@
+services:
+  stt-service:
+    build: .
+    ports:
+      - "8003:8003"
+    volumes:
+      # Mount local data directories
+      - /home/ubuntu/openbooklm-local/data/stt-models:/app/models
+      - /home/ubuntu/openbooklm-local/data/stt-uploads:/app/uploads
+      - /home/ubuntu/openbooklm-local/data/stt-transcripts:/app/transcripts
+      - /home/ubuntu/openbooklm-local/data/stt-logs:/app/logs
+    environment:
+      - MODEL_SIZE=base
+      - MAX_FILE_SIZE_MB=500
+      - CHUNK_DURATION_SECONDS=300
+      - LOG_LEVEL=INFO
+      - ENABLE_WEBSOCKET=true
+      - PYTHONPATH=/app
+      - WHISPER_MODEL_PATH=/app/models/whisper
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          memory: 4G
+          cpus: '2'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; response = requests.get('http://localhost:8003/health', timeout=5); exit(0) if response.status_code == 200 else exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

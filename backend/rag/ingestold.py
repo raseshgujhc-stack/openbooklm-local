@@ -1,6 +1,7 @@
 # rag/ingest.py
 
 import uuid
+import sqlite3
 from pathlib import Path
 from datetime import datetime
 import hashlib
@@ -11,7 +12,13 @@ from rag.embedder import embed_texts
 from rag.vector_store import save_vectors
 from rag.llm import llm
 
-from db import get_repo   # ✅ NEW
+
+# ============================================================
+# DATABASE PATH (SAFE, ABSOLUTE)
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "data" / "notebooks.db"
 
 
 # ============================================================
@@ -34,6 +41,11 @@ def compute_file_hash(text: str) -> str:
 # ============================================================
 
 def extract_decision_date(text: str):
+    """
+    Extracts judgment/order date from header only.
+    Looks for 'JUDGMENT DATED:' or 'DATED:' etc.
+    """
+
     header = text[:1500]
 
     patterns = [
@@ -52,10 +64,15 @@ def extract_decision_date(text: str):
 
 
 # ============================================================
-# CASE NUMBER EXTRACTION (STRICT)
+# CASE NUMBER EXTRACTION (SAFE, DETERMINISTIC)
 # ============================================================
 
 def extract_case_number(text: str):
+    """
+    Court-safe extraction for High Court formats.
+    Does NOT guess.
+    """
+
     header = text[:1200]
 
     patterns = [
@@ -77,12 +94,19 @@ def extract_case_number(text: str):
 # ============================================================
 
 def extract_llm_metadata(text: str) -> dict:
+    """
+    Conservative judicial metadata extraction.
+    LLM is allowed to classify, not invent.
+    """
+
     prompt = f"""
 You are a judicial document metadata extractor.
 
 RULES:
 - Extract ONLY if explicitly present
 - Do NOT guess
+- If 'ORDER' or 'ORAL ORDER' appears near the top → document_type = "Order"
+- If 'JUDGMENT' or 'JUDGMENT DATED' appears near the top → document_type = "Judgment"
 
 Return VALID JSON exactly in this format:
 {{
@@ -102,7 +126,12 @@ Document Text:
 ----------------
 """
 
-    response = llm(prompt, temperature=0.0, max_tokens=300)
+    response = llm(
+        prompt,
+        temperature=0.0,
+        max_tokens=300,
+    )
+
     raw = response["choices"][0]["text"].strip()
 
     try:
@@ -122,6 +151,69 @@ Document Text:
 
 
 # ============================================================
+# SAVE METADATA TO DATABASE
+# ============================================================
+
+def save_document_metadata(
+    document_id: str,
+    filename: str | None,
+    metadata: dict,
+    user_id: str | None,
+    collection_id: str | None,
+):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    INSERT OR REPLACE INTO document_metadata (
+        document_id,
+        filename,
+        file_hash,
+        page_count,
+        word_count,
+        language,
+        document_type,
+        case_stage,
+        petition_type,
+        act_name,
+        court_level,
+        case_number,
+        order_date,
+        bench,
+        domain,
+        user_id,
+        collection_id,
+        created_at,
+        ingested_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        document_id,
+        filename,
+        metadata.get("file_hash"),
+        metadata.get("page_count"),
+        metadata.get("word_count"),
+        metadata.get("language"),
+        metadata.get("document_type"),
+        metadata.get("case_stage"),
+        metadata.get("petition_type"),
+        metadata.get("act_name"),
+        metadata.get("court_level"),
+        metadata.get("case_number"),
+        metadata.get("order_date"),
+        metadata.get("bench"),
+        metadata.get("domain"),
+        user_id,
+        collection_id,
+        datetime.utcnow().isoformat(),
+        datetime.utcnow().isoformat(),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
 # MAIN INGEST FUNCTION
 # ============================================================
 
@@ -135,7 +227,7 @@ def ingest_document(
     """
     Ingests ONE document:
     - FAISS vectors
-    - PostgreSQL metadata
+    - Judicial-grade metadata
     """
 
     if not document_id:
@@ -166,38 +258,37 @@ def ingest_document(
 
     header_upper = text[:1000].upper()
 
+    # Deterministic judicial overrides (SAFE)
     if "JUDGMENT" in header_upper:
         llm_meta["document_type"] = "Judgment"
         llm_meta["domain"] = "Judicial"
+
     elif "ORDER" in header_upper:
         llm_meta["document_type"] = "Order"
         llm_meta["domain"] = "Judicial"
 
+    # Case number fallback (regex, not guessing)
     if not llm_meta.get("case_number"):
         llm_meta["case_number"] = extract_case_number(text)
 
     final_metadata = {
-        "document_id": document_id,
-        "filename": filename,
-        "user_id": user_id,
-        "collection_id": collection_id,
-
         **basic_meta,
         **llm_meta,
-
         "file_hash": compute_file_hash(text),
         "page_count": None,
         "order_date": extract_decision_date(text),
-
-        "created_at": datetime.utcnow().isoformat(),
-        "ingested_at": datetime.utcnow().isoformat(),
     }
 
     # ----------------------------
-    # 3. SAVE METADATA (POSTGRES)
+    # 3. SAVE METADATA
     # ----------------------------
-    repo = get_repo()
-    repo.insert_document(final_metadata)
+    save_document_metadata(
+        document_id=document_id,
+        filename=filename,
+        metadata=final_metadata,
+        user_id=user_id,
+        collection_id=collection_id,
+    )
 
     return {
         "document_id": document_id,

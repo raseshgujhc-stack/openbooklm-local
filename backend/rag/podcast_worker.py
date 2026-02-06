@@ -1,10 +1,10 @@
 # rag/podcast_worker.py
 
-import re
 import subprocess
 from pathlib import Path
+import traceback
 
-from rag.db import get_db
+from db import get_repo
 from rag.vector_store import load_texts
 from rag.podcast import generate_podcast_script
 from rag.tts_client import generate_audio_segment
@@ -20,15 +20,20 @@ def run_podcast_job(
     user_id: str,
     speakers: int,
 ):
-    db = get_db()
+    repo = get_repo()
+    cur = repo.conn.cursor()
 
     try:
         # 1️⃣ Mark job as running
-        db.execute(
-            "UPDATE podcast_jobs SET status=? WHERE id=?",
-            ("running", job_id),
+        cur.execute(
+            """
+            UPDATE podcast_jobs
+            SET status = %s
+            WHERE id = %s AND user_id = %s
+            """,
+            ("running", job_id, user_id),
         )
-        db.commit()
+        repo.conn.commit()
 
         # 2️⃣ Load notebook text
         texts = load_texts(notebook_id)
@@ -44,15 +49,16 @@ def run_podcast_job(
         )
 
         # 4️⃣ Save script immediately (UI depends on this)
-        db.execute(
+        cur.execute(
             """
             UPDATE podcast_jobs
-            SET status=?, result=?
-            WHERE id=?
+            SET status = %s,
+                result = %s
+            WHERE id = %s AND user_id = %s
             """,
-            ("script_ready", script, job_id),
+            ("script_ready", script, job_id, user_id),
         )
-        db.commit()
+        repo.conn.commit()
 
         # 5️⃣ Generate multi-speaker audio (best effort)
         try:
@@ -67,8 +73,6 @@ def run_podcast_job(
 
             for raw_line in script.splitlines():
                 line = raw_line.strip()
-
-                # Expect: Name: sentence
                 if ":" not in line:
                     continue
 
@@ -76,14 +80,10 @@ def run_podcast_job(
                 speaker_name = speaker_name.strip()
                 text = text.strip()
 
-                if speaker_name not in speaker_map:
-                    continue
-
-                if not text:
+                if speaker_name not in speaker_map or not text:
                     continue
 
                 speaker_id = speaker_map[speaker_name]
-
                 segment_path = AUDIO_DIR / f"{job_id}_{speaker_id}_{len(segments)}.wav"
 
                 generate_audio_segment(
@@ -123,11 +123,16 @@ def run_podcast_job(
             )
 
             # 7️⃣ Save final audio path
-            db.execute(
-                "UPDATE podcast_jobs SET status=?, audio_path=? WHERE id=?",
-                ("done", str(final_audio), job_id),
+            cur.execute(
+                """
+                UPDATE podcast_jobs
+                SET status = %s,
+                    audio_path = %s
+                WHERE id = %s AND user_id = %s
+                """,
+                ("done", str(final_audio), job_id, user_id),
             )
-            db.commit()
+            repo.conn.commit()
 
             print(f"[PODCAST] Audio generated for job {job_id}")
 
@@ -136,11 +141,18 @@ def run_podcast_job(
             print("[PODCAST] TTS failed:", tts_err)
 
     except Exception as e:
-        db.execute(
-            "UPDATE podcast_jobs SET status=?, error=? WHERE id=?",
-            ("error", str(e), job_id),
+        repo.conn.rollback()
+        cur.execute(
+            """
+            UPDATE podcast_jobs
+            SET status = %s,
+                error = %s
+            WHERE id = %s AND user_id = %s
+            """,
+            ("error", str(e), job_id, user_id),
         )
-        db.commit()
+        repo.conn.commit()
 
-    finally:
-        db.close()
+        print("❌ Podcast job failed")
+        traceback.print_exc()
+
