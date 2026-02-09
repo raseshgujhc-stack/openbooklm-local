@@ -7,6 +7,8 @@ from fastapi import (
     Depends,
     Header,
 )
+import threading
+from ingest_worker import ingest_worker_loop
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid
@@ -53,6 +55,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.on_event("startup")
+def start_ingest_worker():
+    thread = threading.Thread(
+        target=ingest_worker_loop,
+        daemon=True,
+    )
+    thread.start()
 
 # ❌ init_db()
 # ❌ init_chat_table()
@@ -131,66 +140,49 @@ def login(data: LoginRequest):
 # --------------------------------------------------
 # Upload PDF
 # --------------------------------------------------
-
 @app.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
-    collection_id: Optional[str] = Form(None),  # ✅ optional
+    collection_id: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
-    text = read_pdf(file)
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Empty PDF")
+    notebook_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+
+    upload_dir = BASE_DIR / "data" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = upload_dir / f"{notebook_id}.pdf"
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
 
     repo = get_repo()
     cur = repo.conn.cursor()
 
-    # 🔐 COLLECTION OWNERSHIP CHECK (ONLY IF PROVIDED)
-    if collection_id:
-        cur.execute(
-            """
-            SELECT 1 FROM collections
-            WHERE collection_id = %s AND user_id = %s
-            """,
-            (collection_id, user_id),
-        )
-        owned = cur.fetchone()
-
-        if not owned:
-            raise HTTPException(
-                status_code=403,
-                detail="Collection not found or not owned by user",
-            )
-
-    # 🔹 Normal PDF pipeline (semantic + metadata)
-    chunks = split_text(text)
-    notebook_id = str(uuid.uuid4())
-
-    # ---- Semantic ingestion (UNCHANGED) ----
-    embeddings = embed(chunks)
-    vectors = [{"text": c, "embedding": e} for c, e in zip(chunks, embeddings)]
-    save_vectors(notebook_id, vectors)
-
-    # ---- Metadata ingestion (REQUIRED) ----
-    ingest_document(
-        text=text,                     # full document text
-        document_id=notebook_id,        # IMPORTANT: keep IDs aligned
-        collection_id=collection_id,
-        user_id=user_id,
-        filename=file.filename,
-    )
-
-    # ---- Notebooks table ----
     cur.execute(
         """
-        INSERT INTO notebooks (notebook_id, filename, user_id, collection_id)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO notebooks
+        (notebook_id, filename, user_id, collection_id, status)
+        VALUES (%s, %s, %s, %s, 'queued')
         """,
         (notebook_id, file.filename, user_id, collection_id),
     )
+
+    cur.execute(
+        """
+        INSERT INTO ingest_jobs
+        (job_id, notebook_id, user_id, status)
+        VALUES (%s, %s, %s, 'queued')
+        """,
+        (job_id, notebook_id, user_id),
+    )
+
     repo.conn.commit()
 
-    return {"notebook_id": notebook_id}
+    return {
+        "notebook_id": notebook_id,
+        "status": "queued"
+    }
 
 
 # --------------------------------------------------

@@ -1,7 +1,26 @@
 # backend/db/postgres_repo.py
 
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import Json
+
+
+JSON_FIELDS = {
+    "act_names",
+    "primary_topics",
+    "secondary_topics",
+    "keywords",
+    "referenced_laws",
+    "section_types",
+    "cited_cases",
+    "cited_courts",
+    "cited_acts",
+    "jurisdiction",
+    "field_confidence",
+    "extraction_notes",
+    "bench",
+    "judge_name",
+}
+
 
 class PostgresMetadataRepository:
     def __init__(self, dsn):
@@ -10,14 +29,18 @@ class PostgresMetadataRepository:
     def insert_document(self, data: dict):
         """
         Insert metadata safely.
-        Only inserts keys that exist in document_metadata table.
+        Automatically serializes JSONB fields.
         """
         columns = []
         values = []
 
         for key, value in data.items():
             columns.append(key)
-            values.append(value)
+
+            if key in JSON_FIELDS and value is not None:
+                values.append(Json(value))   # ✅ FIX
+            else:
+                values.append(value)
 
         cols_sql = ", ".join(columns)
         placeholders = ", ".join(["%s"] * len(values))

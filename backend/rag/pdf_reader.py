@@ -1,23 +1,6 @@
 from pypdf import PdfReader
+from pathlib import Path
 
-#def read_pdf(upload_file):
-#    upload_file.file.seek(0)
-#    reader = PdfReader(upload_file.file)
-
-#    pages_text = []
-
-#    for i, page in enumerate(reader.pages):
-#        text = page.extract_text() or ""
-
-        # Normalize whitespace
-#        text = text.replace("\xa0", " ")
-#        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-
-        # Force page markers (important for headers)
-#        page_block = f"\n\n=== PAGE {i+1} ===\n{text}"
-#        pages_text.append(page_block)
-
-#    return "\n".join(pages_text)
 
 def read_pdf(upload_file):
     upload_file.file.seek(0)
@@ -32,7 +15,20 @@ def read_pdf(upload_file):
             text += page_text + "\n"
 
     print("===== RAW PDF TEXT START =====")
-    print(text[:3000])  # first 3k chars
+    print(text[:3000])
     print("===== RAW PDF TEXT END =====")
 
     return text
+
+
+# ✅ NEW: adapter for background worker
+class FileLike:
+    def __init__(self, file_obj):
+        self.file = file_obj
+
+
+def read_pdf_from_path(path: Path) -> str:
+    with open(path, "rb") as f:
+        fake_upload = FileLike(f)
+        return read_pdf(fake_upload)
+
