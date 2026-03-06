@@ -1,3 +1,12 @@
+"""
+Utility script to prepare speaker directories and optionally run XTTS smoke tests.
+
+Expected usage:
+- create `/data/speakers/<speaker>/` folders
+- place `ref1.wav` inside each speaker folder
+- optionally generate sample audio to validate the model + speaker setup
+"""
+
 from TTS.api import TTS
 from pathlib import Path
 

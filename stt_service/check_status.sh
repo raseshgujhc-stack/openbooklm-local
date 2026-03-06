@@ -1,11 +1,13 @@
 #!/bin/bash
 # check_status.sh
 
+set -euo pipefail
+
 echo "STT Service Status"
 echo "================="
 
-# Check if container is running
-if docker ps | grep -q stt-service; then
+# Check compose service first; fallback to old manual container name.
+if docker compose ps --status running stt-service 2>/dev/null | grep -q stt-service || docker ps --format '{{.Names}}' | grep -q '^stt-service$'; then
     echo "✅ Container is running"
     
     # Check health endpoint
@@ -19,7 +21,10 @@ if docker ps | grep -q stt-service; then
     # Show container stats
     echo ""
     echo "Container stats:"
-    docker stats stt-service --no-stream
+    cname="$(docker ps --format '{{.Names}}' | grep -E '^stt_service-stt-service-1$|^stt-service$' | head -n1 || true)"
+    if [ -n "$cname" ]; then
+      docker stats "$cname" --no-stream
+    fi
     
 else
     echo "❌ Container is not running"

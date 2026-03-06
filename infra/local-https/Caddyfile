@@ -1,0 +1,28 @@
+{$LAN_HOST}:443 {
+    tls internal {
+        curves x25519 secp256r1
+    }
+    encode zstd gzip
+
+    @backend path /backend/*
+    handle @backend {
+        uri strip_prefix /backend
+        reverse_proxy http://host.docker.internal:8002
+    }
+
+    @stt path /stt/*
+    handle @stt {
+        uri strip_prefix /stt
+        reverse_proxy http://host.docker.internal:8003
+    }
+
+    @tts path /tts/*
+    handle @tts {
+        uri strip_prefix /tts
+        reverse_proxy http://host.docker.internal:9000
+    }
+
+    handle {
+        reverse_proxy http://host.docker.internal:3000
+    }
+}

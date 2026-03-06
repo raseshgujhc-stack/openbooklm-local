@@ -3,7 +3,7 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 
 # Use same model for both documents and queries
-model = SentenceTransformer("BAAI/bge-small-en-v1.5")  # Explicit model name
+model = SentenceTransformer("./models/bge-base")  # Explicit model name
 
 def embed(texts):
     """

@@ -2,6 +2,7 @@ FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
+RUN mkdir -p /app/legislation
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -24,4 +25,3 @@ EXPOSE 8003
 
 # Run app
 CMD ["python", "main.py"]
-

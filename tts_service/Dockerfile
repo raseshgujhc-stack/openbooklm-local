@@ -1,3 +1,5 @@
+# TTS service container image.
+# Builds a CPU-compatible XTTS runtime and serves FastAPI on port 9000.
 FROM python:3.11-slim
 
 WORKDIR /app

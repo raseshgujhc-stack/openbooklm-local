@@ -1,5 +1,17 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Workspace Note
+
+In this repository, the active application flow is documented in:
+- `README.md`
+- `docs/DEVELOPMENT_MANUAL.md`
+- `docs/FILE_FLOW_MAP.md`
+
+Current runtime uses:
+- async chat submit/poll APIs
+- notebook ingestion gating before chat
+- partial collection chat while some docs are still ingesting
+
 ## Getting Started
 
 First, run the development server:

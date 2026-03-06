@@ -1,6 +1,7 @@
 # rag/semantic_engine.py
 
-from rag.llm import ask_llm, llm_generate_text
+from rag.llm import ask_llm
+from rag.model_router import qwen_summary
 from rag.vector_store import load_vectors, get_collection_notebooks
 from rag.embedder import embed_texts
 import numpy as np
@@ -62,5 +63,4 @@ Extracted Answers:
 Final Answer:
 """
 
-    return llm_generate_text(synthesis_prompt).strip()
-
+    return qwen_summary(synthesis_prompt, max_tokens=500, temperature=0.25).strip()

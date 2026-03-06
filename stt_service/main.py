@@ -1,8 +1,18 @@
+"""
+Judicial STT service entrypoint.
+
+Exposes:
+- WebSocket stream transcription (/ws/transcribe)
+- Health and diagnostics endpoints
+- File transcription API router (/api/v1/*)
+"""
+
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pathlib import Path
 import asyncio
+import threading
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -74,6 +84,9 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
         self.transcriber = None
+        self.model_loading = False
+        self.model_ready = False
+        self.model_error: str | None = None
     
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -99,10 +112,34 @@ manager = ConnectionManager()
 # Initialize transcriber lazily
 def get_transcriber():
     if manager.transcriber is None:
-        from core_models.transcription import JudicialTranscriber
-        manager.transcriber = JudicialTranscriber()
+        from core_models.transcription import get_shared_transcriber
+        manager.transcriber = get_shared_transcriber()
         logger.info("Transcriber initialized")
     return manager.transcriber
+
+
+def warmup_model_background():
+    # Remark: warm Whisper model asynchronously so first user request is stable.
+    if manager.model_loading or manager.model_ready:
+        return
+    manager.model_loading = True
+    manager.model_error = None
+    try:
+        transcriber = get_transcriber()
+        transcriber.load_model()
+        manager.model_ready = True
+        logger.info("Whisper model warmup complete")
+    except Exception as e:
+        manager.model_error = str(e)
+        logger.exception("Whisper model warmup failed: %s", e)
+    finally:
+        manager.model_loading = False
+
+
+@app.on_event("startup")
+def startup_warmup():
+    thread = threading.Thread(target=warmup_model_background, daemon=True)
+    thread.start()
 
 # Handle OPTIONS requests for CORS preflight
 @app.options("/{rest_of_path:path}")
@@ -120,12 +157,6 @@ async def options_handler():
 # WebSocket endpoint for live transcription
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
-    # Add CORS headers for WebSocket connection
-    websocket.headers.update({
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Credentials": "true"
-    })
-    
     await manager.connect(websocket)
     transcriber = get_transcriber()
     
@@ -146,19 +177,27 @@ async def websocket_transcribe(websocket: WebSocket):
                 # Process audio chunk
                 audio_data = message["data"]
                 language = message.get("language", "en")
+                format_type = message.get("format_type", "high_court")
+                mime_type = message.get("mime_type")
                 
                 # Transcribe audio
                 try:
                     transcript = transcriber.transcribe_chunk(
                         audio_data, 
-                        language=language
+                        language=language,
+                        format_type=format_type,
+                        mime_type=mime_type,
                     )
+
+                    if transcript.get("error"):
+                        raise RuntimeError(transcript["error"])
                     
                     # Send transcription back
                     await manager.send_message({
                         "type": "transcription",
                         "text": transcript["text"],
                         "formatted": transcript.get("formatted", transcript["text"]),
+                        "format_type": transcript.get("format_type", format_type),
                         "timestamp": datetime.now().isoformat(),
                         "language": language
                     }, websocket)
@@ -214,6 +253,9 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "websocket_connections": len(manager.active_connections),
+        "model_ready": manager.model_ready,
+        "model_loading": manager.model_loading,
+        "model_error": manager.model_error,
         "system": {
             "cpu_percent": psutil.cpu_percent(),
             "memory_used_gb": psutil.virtual_memory().used / (1024**3),

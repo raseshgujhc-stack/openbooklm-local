@@ -1,17 +1,23 @@
+import os
 from llama_cpp import Llama
 
 MODEL_PATH = "./models/mistral-7b-instruct.gguf"
+LLM_N_CTX = int(os.getenv("MISTRAL_N_CTX", "8192"))
+LLM_N_THREADS = int(os.getenv("MISTRAL_THREADS", str(max(1, (os.cpu_count() or 8) - 1))))
+RAG_ANSWER_MAX_TOKENS = int(os.getenv("RAG_ANSWER_MAX_TOKENS", "700"))
 
 llm = Llama(
     model_path=MODEL_PATH,
-    n_ctx=4096,
-    n_threads=8,
+    # Remark: n_ctx is runtime window; keep configurable for CPU/RAM tradeoff.
+    n_ctx=LLM_N_CTX,
+    n_threads=LLM_N_THREADS,
+    verbose=False,
 )
 
 # ===============================
 # STRICT DOCUMENT Q&A (RAG ONLY)
 # ===============================
-def ask_llm(context: str, question: str) -> str:
+def ask_llm(context: str, question: str, max_tokens: int | None = None) -> str:
     prompt = f"""
 You are an information extraction system.
 
@@ -36,7 +42,8 @@ Answer:
 
     output = llm(
         prompt,
-        max_tokens=256,
+        # Remark: keep output budget configurable to avoid mid-answer truncation.
+        max_tokens=max_tokens or RAG_ANSWER_MAX_TOKENS,
         temperature=0.0,      # 🚨 VERY IMPORTANT
         top_p=1.0,
         stop=["Question:", "Document Text:"],

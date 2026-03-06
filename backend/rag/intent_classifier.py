@@ -1,3 +1,4 @@
+#rag/intent_classifier.py
 from rag.llm import llm
 import json
 
@@ -36,5 +37,31 @@ Question:
         max_tokens=200
     )
 
-    return json.loads(response["choices"][0]["text"])
+    import re
+    raw_text = response["choices"][0]["text"].strip()
+
+    # Extract JSON block if LLM added extra text
+    json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+
+    if not json_match:
+        print("⚠ Intent classifier returned invalid JSON:")
+        print(raw_text)
+        return {
+            "intent_type": "semantic",
+            "operation": None,
+            "entities": {},
+            "filters": {}
+        }
+
+    try:
+        return json.loads(json_match.group())
+    except Exception as e:
+        print("⚠ JSON parsing failed:", e)
+        print("Raw response:", raw_text)
+        return {
+            "intent_type": "semantic",
+            "operation": None,
+            "entities": {},
+            "filters": {}
+        }
 

@@ -54,3 +54,5 @@ uploaded_pdfs/
 logs/
 *.log
 tmp/
+legal_act_sections_refined.csv
+structured_legislation_v4.csv

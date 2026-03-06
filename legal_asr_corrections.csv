@@ -1,0 +1,30 @@
+pattern,replacement,scope,requires_any,priority,enabled
+\bcoral order\b,ORAL ORDER,legal,order|application|section,230,true
+\boral order point number one\b,ORAL ORDER 1.,legal,order|application|section,225,true
+\bcombination of delay\b,condonation of delay,legal,delay|appeal|limitation,220,true
+\bapplicant\s+6\s+combination\s+of\s+delay\b,applicant seeks condonation of delay,legal,delay|appeal|limitation,220,true
+\bapplicant\s+6\s+condonation\s+of\s+delay\b,applicant seeks condonation of delay,legal,delay|appeal|limitation,220,true
+\bapplicant\s+6\b,applicant seeks,legal,delay|appeal|application,160,true
+\bcaused a\s+infiling\b,caused in filing,legal,delay|appeal|application,215,true
+\bcaption revision application\b,captioned revision application,legal,revision|application,210,true
+\bwritten\W+evil\W+forth\s*with\b,returnable forthwith,legal,rule|returnable|forthwith,230,true
+\breturnable\W+forth\s*with\b,returnable forthwith,legal,rule|returnable|forthwith,210,true
+\bbased service\b,waives service,legal,respondent|state|prosecutor|learned,220,true
+\bwaives service of the respondent[- ]state\b,waives service for the respondent-State,legal,respondent|state|prosecutor,220,true
+\blearned additional public prosecutor[, ]+based service\b,Learned Additional Public Prosecutor waives service,legal,respondent|state|prosecutor,220,true
+\brespondent state\b,respondent-State,legal,respondent|state,205,true
+\brule[, ]+returnable[, ]+forth\s*with\b,Rule, returnable forthwith.,legal,rule|returnable|forthwith,220,true
+\bconformation of delay\b,condonation of delay,legal,delay|appeal,200,true
+\bconfirmation of delay\b,condonation of delay,legal,delay|appeal,200,true
+\bcaption appeal\b,captioned appeal,legal,appeal,170,true
+\byear in after\b,hereinafter,legal,act|section|referred,170,true
+\bhere in after\b,hereinafter,legal,act|section|referred,170,true
+\breferred to as sni act\b,referred to as NI Act,legal,act|section,170,true
+\bni act\b,NI Act,legal,act|section,160,true
+\bnegotiable instrument act\b,Negotiable Instruments Act,legal,act|section,170,true
+\boriginal complaint\b,original complainant,legal,complainant|accused|appeal,150,true
+\bjudgment and another order\b,judgment and order,legal,judgment|order,140,true
+\bDetailed\s+(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})\b,Dated \1,legal,date|dated|judgment,150,true
+\bB\s*\.?\s*N\s*\.?\s*S\s*\.?\s*S\b,BNSS,legal,section|act,160,true
+\bN\s*\.?\s*I\s*\.?\s*Act\b,NI Act,legal,section|act,160,true
+\bslas\b,slash,global,,120,true

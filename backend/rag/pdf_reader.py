@@ -1,3 +1,10 @@
+"""
+PDF text extraction helpers.
+
+Provides upload-file and file-path adapters so ingestion workers and API paths
+reuse the same extraction logic.
+"""
+
 from pypdf import PdfReader
 from pathlib import Path
 
@@ -31,4 +38,3 @@ def read_pdf_from_path(path: Path) -> str:
     with open(path, "rb") as f:
         fake_upload = FileLike(f)
         return read_pdf(fake_upload)
-

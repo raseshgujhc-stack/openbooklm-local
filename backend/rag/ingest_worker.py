@@ -4,6 +4,7 @@ from ingest_runner import run_ingestion
 
 
 POLL_INTERVAL = 2  # seconds
+STALE_PROCESSING_MINUTES = 20
 
 
 def ingest_worker_loop():
@@ -12,6 +13,30 @@ def ingest_worker_loop():
     while True:
         repo = get_repo()
         cur = repo.conn.cursor()
+
+        # Remark: recover jobs left in "processing" if the worker crashed/restarted.
+        cur.execute(
+            """
+            WITH stale_jobs AS (
+                UPDATE ingest_jobs
+                SET status='queued',
+                    started_at=NULL,
+                    error='Auto-requeued after stale processing timeout'
+                WHERE status='processing'
+                  AND started_at < now() - (%s || ' minutes')::interval
+                RETURNING notebook_id
+            )
+            UPDATE notebooks n
+            SET status='queued'
+            FROM stale_jobs s
+            WHERE n.notebook_id = s.notebook_id
+            RETURNING n.notebook_id
+            """,
+            (STALE_PROCESSING_MINUTES,),
+        )
+        recovered = cur.fetchall()
+        if recovered:
+            print(f"♻️ Re-queued stale ingest jobs: {len(recovered)}")
 
         # Pick next queued job safely
         cur.execute(
@@ -106,4 +131,3 @@ def ingest_worker_loop():
             repo.conn.commit()
 
             print(f"❌ Failed ingest {notebook_id}: {e}")
-
