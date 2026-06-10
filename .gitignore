@@ -12,6 +12,7 @@ venv/
 # ========================
 # Models (VERY IMPORTANT)
 # ========================
+data/stt-models/
 models/
 *.bin
 *.gguf
